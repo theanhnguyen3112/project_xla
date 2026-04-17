@@ -1,102 +1,147 @@
 import os
 import cv2
-from facenet_pytorch import MTCNN, InceptionResnetV1
-from ultralytics import YOLO
+import torch
 import pickle
 import numpy as np
+from ultralytics import YOLO
+from facenet_pytorch import InceptionResnetV1
 
-# Load YOLOv8 model
-try:
-    model = YOLO("detection/weights/best.pt")  
-    print("YOLOv8 model loaded successfully.")
-except Exception as e:
-    print(f"Error loading YOLOv8 model: {e}")
+# =========================
+# INIT MODELS
+# =========================
+model = YOLO("detection/weights/best.pt")
+print("YOLOv8 model loaded successfully.")
 
-# Load MTCNN and InceptionResnetV1 models
-try:
-    mtcnn = MTCNN(keep_all=True)
-    resnet = InceptionResnetV1(pretrained='vggface2').eval()
-    print("MTCNN and InceptionResnetV1 models loaded successfully.")
-except Exception as e:
-    print(f"Error loading MTCNN/InceptionResnetV1: {e}")
+resnet = InceptionResnetV1(pretrained='vggface2').eval()
+print("FaceNet model loaded successfully.")
 
-# Load known embeddings
+# =========================
+# LOAD EMBEDDINGS
+# =========================
 def load_known_embeddings():
     try:
-        with open('known_embeddings.pkl', 'rb') as f:
-            known_embeddings = pickle.load(f)
-            print("Known embeddings loaded successfully.")
-    except Exception as e:
-        known_embeddings = {}
-        print(f"Error loading known embeddings: {e}")
-    return known_embeddings
+        with open("known_embeddings.pkl", "rb") as f:
+            data = pickle.load(f)
+        print("Known embeddings loaded successfully.")
+    except:
+        data = {}
+        print("No embeddings found.")
+
+    # CLEAN DATA
+    cleaned = {}
+    for name, emb_list in data.items():
+        valid = []
+        for emb in emb_list:
+            if isinstance(emb, np.ndarray) and emb.shape == (512,):
+                valid.append(emb / np.linalg.norm(emb))
+        if len(valid) > 0:
+            cleaned[name] = valid
+
+    return cleaned
 
 known_embeddings = load_known_embeddings()
 
-# Function to compare embeddings
-def compare_embeddings(embedding, known_embeddings):
-    threshold = 0.2
-    min_dist = float('inf')
-    match = "Unknown"
+# =========================
+# EMBEDDING FUNCTION
+# =========================
+def get_embedding(face):
+    if face is None or face.size == 0:
+        return None
 
-    for name, known_embedding in known_embeddings.items():
-        dist = np.linalg.norm(np.array(embedding) - np.array(known_embedding))
-        if dist < min_dist:
-            min_dist = dist
-            match = name if dist < threshold else "Unknown"
+    face = cv2.resize(face, (160, 160))
+    face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
 
-    print(f"Min distance: {min_dist}, Match: {match}")
-    return match
+    face_tensor = torch.tensor(face).permute(2, 0, 1).float() / 255.0
+    face_tensor = face_tensor.unsqueeze(0)
 
-# Open webcam
+    with torch.no_grad():
+        emb = resnet(face_tensor).cpu().numpy().flatten()
+
+    emb = emb / np.linalg.norm(emb)
+    return emb
+
+# =========================
+# COSINE SIMILARITY
+# =========================
+def cosine_similarity(a, b):
+    return np.dot(a, b)
+
+# =========================
+# COMPARE
+# =========================
+def recognize_face(embedding, known_embeddings, threshold=0.6):
+    best_match = "Unknown"
+    best_score = -1
+
+    for name, emb_list in known_embeddings.items():
+        for known_emb in emb_list:
+
+            if known_emb is None:
+                continue
+
+            score = cosine_similarity(embedding, known_emb)
+
+            if score > best_score:
+                best_score = score
+                best_match = name
+
+    if best_score < threshold:
+        best_match = "Unknown"
+
+    print(f"Best score: {best_score:.3f} → {best_match}")
+    return best_match
+
+# =========================
+# WEBCAM
+# =========================
 cap = cv2.VideoCapture(0)
+
 if not cap.isOpened():
-    print("Error: Unable to open the webcam.")
+    print("Cannot open webcam")
     exit()
 
+# =========================
+# MAIN LOOP
+# =========================
 while True:
     ret, frame = cap.read()
     if not ret:
-        print("Error: Unable to read from the webcam.")
         break
 
-    # Detect faces using YOLOv8
     results = model(frame)
-    boxes = results[0].boxes
-    print(f"Number of faces detected: {len(boxes)}")
 
-    faces = []
-    for box in boxes:
-        x1, y1, x2, y2 = box.xyxy[0].int().tolist()
-        face = frame[y1:y2, x1:x2]
-        faces.append(face)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    if results[0].boxes is not None:
+        boxes = results[0].boxes.xyxy.cpu().numpy()
 
-    embeddings = []
-    for face in faces:
-        # Ensure the face is converted to a format suitable for MTCNN
-        face_rgb = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
-        boxes, probs = mtcnn.detect(face_rgb)
-        if boxes is not None:
-            face_tensor = mtcnn(face_rgb).squeeze().unsqueeze(0)
-            face_embedding = resnet(face_tensor).detach().cpu().numpy().flatten()
-            embeddings.append(face_embedding)
-            print("Embedding extracted:", face_embedding)
-        else:
-            print("No faces detected by MTCNN in the cropped image.")
-    
-    for embedding in embeddings:
-        match = compare_embeddings(embedding, known_embeddings)
-        print("Face recognized as:", match)
         for box in boxes:
-            if boxes is not None:
-                x1, y1, x2, y2 = map(int, box)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, match, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (36, 255, 12), 2)
+            x1, y1, x2, y2 = map(int, box)
 
+            h, w = frame.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
 
-    cv2.imshow('Camera Feed', frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            face = frame[y1:y2, x1:x2]
+
+            embedding = get_embedding(face)
+
+            if embedding is None:
+                continue
+
+            name = recognize_face(embedding, known_embeddings)
+
+            # DRAW
+            color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, name, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+    cv2.imshow("Face Recognition", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
 cap.release()

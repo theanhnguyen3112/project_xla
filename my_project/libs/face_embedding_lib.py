@@ -9,29 +9,60 @@ from facenet_pytorch import InceptionResnetV1
 
 class FaceEmbeddingManager:
     def __init__(self,
-                 yolo_model_path="weights/best.pt",
-                 embedding_file="database/known_embeddings.pkl"):
+                 yolo_model_path="detection/weights/best.pt",
+                 embedding_file="known_embeddings.pkl"):
 
         lib_dir = os.path.dirname(os.path.abspath(__file__))
-        project_dir = os.path.dirname(lib_dir)
+        my_project_dir = os.path.dirname(lib_dir)
+        repo_root_dir = os.path.dirname(my_project_dir)
 
         if not os.path.isabs(yolo_model_path):
-            yolo_model_path = os.path.join(lib_dir, yolo_model_path)
+            yolo_model_path = os.path.join(repo_root_dir, yolo_model_path)
 
         if not os.path.isabs(embedding_file):
-            embedding_file = os.path.join(project_dir, embedding_file)
+            embedding_file = os.path.join(repo_root_dir, embedding_file)
 
         self.model = YOLO(yolo_model_path)
         self.resnet = InceptionResnetV1(pretrained='vggface2').eval()
 
         self.embedding_file = embedding_file
-        os.makedirs(os.path.dirname(self.embedding_file), exist_ok=True)
+        embedding_dir = os.path.dirname(self.embedding_file)
+        if embedding_dir:
+            os.makedirs(embedding_dir, exist_ok=True)
 
         if os.path.exists(self.embedding_file):
             with open(self.embedding_file, "rb") as f:
-                self.known_embeddings = pickle.load(f)
+                loaded_data = pickle.load(f)
+            self.known_embeddings = self._clean_embeddings(loaded_data)
         else:
             self.known_embeddings = {}
+
+    @staticmethod
+    def _clean_embeddings(data):
+        cleaned = {}
+        if not isinstance(data, dict):
+            return cleaned
+
+        for name, emb_list in data.items():
+            valid = []
+            if not isinstance(emb_list, (list, tuple)):
+                continue
+
+            for emb in emb_list:
+                emb_array = np.array(emb)
+                if emb_array.shape != (512,):
+                    continue
+
+                norm = np.linalg.norm(emb_array)
+                if norm == 0:
+                    continue
+
+                valid.append(emb_array / norm)
+
+            if valid:
+                cleaned[name] = valid
+
+        return cleaned
 
     def get_embedding(self, face_img):
         if face_img is None or face_img.size == 0:
@@ -46,7 +77,11 @@ class FaceEmbeddingManager:
         with torch.no_grad():
             embedding = self.resnet(face_tensor).cpu().numpy().flatten()
 
-        embedding = embedding / np.linalg.norm(embedding)
+        norm = np.linalg.norm(embedding)
+        if norm == 0:
+            return None
+
+        embedding = embedding / norm
         return embedding
 
     def process_images(self, image_list):
@@ -79,13 +114,23 @@ class FaceEmbeddingManager:
         return embeddings
 
     def save_person(self, person_name, embeddings):
-        if len(embeddings) == 0:
+        valid_embeddings = []
+        for emb in embeddings:
+            emb_array = np.array(emb)
+            if emb_array.shape != (512,):
+                continue
+            norm = np.linalg.norm(emb_array)
+            if norm == 0:
+                continue
+            valid_embeddings.append(emb_array / norm)
+
+        if len(valid_embeddings) == 0:
             return False
 
         if person_name not in self.known_embeddings:
             self.known_embeddings[person_name] = []
 
-        self.known_embeddings[person_name].extend(embeddings)
+        self.known_embeddings[person_name].extend(valid_embeddings)
 
         with open(self.embedding_file, "wb") as f:
             pickle.dump(self.known_embeddings, f)
